@@ -14,7 +14,7 @@ import hmac
 # =============================================================================
 # Cette application Streamlit permet :
 #   1. d'ajouter des rendez-vous (écrits dans un Google Sheet) ;
-#   2. d'afficher le planning de la semaine ;
+#   2. d'afficher le planning (vue Mois façon agenda Excel, ou Semaine / Jour) ;
 #   3. de repérer automatiquement les rendez-vous qui se chevauchent ;
 #   4. de consulter et supprimer les rendez-vous.
 #
@@ -28,16 +28,73 @@ import hmac
 # >>> PERSONNALISATION — AJOUTER / RENOMMER / RECOLORER UNE CATÉGORIE
 #
 #   "emoji"   : petit symbole affiché devant le rdv
-#   "couleur" : couleur de la bordure de la carte dans le planning
-#   "fond"    : couleur de fond de la carte
+#   "couleur" : couleur du bloc dans le calendrier (format "#RRGGBB")
+#
+# Pour les rdv « Client », la couleur vient plutôt du client (voir plus bas).
 # =============================================================================
 
 CATEGORIES = {
-    "Client":  {"emoji": "🏢", "couleur": "#3D52A0", "fond": "#EDE8F5"},
-    "Médical": {"emoji": "🩺", "couleur": "#1B7A3D", "fond": "#E8F5E9"},
-    "Perso":   {"emoji": "👤", "couleur": "#E8850C", "fond": "#FFF6E8"},
-    "Autre":   {"emoji": "📌", "couleur": "#888888", "fond": "#F5F5F5"},
+    "Client":   {"emoji": "🏢", "couleur": "#8697C4"},
+    "Médical":  {"emoji": "🩺", "couleur": "#C9B6D9"},
+    "Perso":    {"emoji": "👤", "couleur": "#F2C6A0"},
+    "Libre":    {"emoji": "🌿", "couleur": "#E4E1DA"},
+    "Vacances": {"emoji": "🏖️", "couleur": "#B5473F"},
+    "Autre":    {"emoji": "📌", "couleur": "#F5EB3B"},
 }
+
+# Catégories qui peuvent durer plusieurs jours (date de début → date de fin)
+CATEGORIES_PLUSIEURS_JOURS = ["Vacances"]
+
+
+# =============================================================================
+# 1b. COULEURS DES CLIENTS (reprises de l'agenda Excel)
+# =============================================================================
+# >>> PERSONNALISATION — COULEUR D'UN CLIENT
+#
+# Clé = nom du client en minuscules (ou un morceau du nom).
+# Un client absent de cette liste reçoit automatiquement une couleur
+# de la palette PALETTE_AUTO, toujours la même pour un même nom.
+# =============================================================================
+
+COULEURS_CLIENTS = {
+    "holcim":      "#F5B800",   # jaune
+    "morges":      "#E0701E",   # orange
+    "santy":       "#5B8FD0",   # bleu
+    "sebastien":   "#7A9A45",   # vert olive
+    "sébastien":   "#7A9A45",
+    "takeda":      "#7B4BB0",   # violet
+    "sushi":       "#EBB7B7",   # rose
+    "neuchâtel":   "#22A84F",   # vert
+    "comadur":     "#8E3FB5",   # violet foncé
+    "infratunnel": "#8E3FB5",
+    "unine":       "#F2C14E",   # jaune doux
+}
+
+PALETTE_AUTO = [
+    "#4DB6AC", "#F06292", "#9575CD", "#4FC3F7", "#AED581",
+    "#FFB74D", "#A1887F", "#90A4AE", "#BA68C8", "#81C784",
+]
+
+
+# =============================================================================
+# 1c. MOMENTS DE LA JOURNÉE
+# =============================================================================
+# >>> PERSONNALISATION — HORAIRES DU MATIN / DE L'APRÈS-MIDI
+#
+# Ces horaires servent à placer le rdv dans l'agenda et à repérer
+# les chevauchements (deux rdv le même matin = alerte).
+# =============================================================================
+
+MOMENTS = {
+    "Matin":         {"emoji": "☀️", "debut": "08:00", "fin": "12:00"},
+    "Après-midi":    {"emoji": "🌇", "debut": "13:00", "fin": "17:00"},
+    "Journée":       {"emoji": "🗓️", "debut": "08:00", "fin": "17:00"},
+    "Heure précise": {"emoji": "🕘", "debut": None,    "fin": None},
+}
+
+# Un rdv qui commence avant MIDI est dans la demi-case du matin,
+# un rdv qui finit après MIDI est dans la demi-case de l'après-midi.
+MIDI = 12 * 60 + 30
 
 
 # =============================================================================
@@ -81,6 +138,8 @@ COLONNES = [
     "Lieu",
     "Notes",
     "Créé le",
+    "Moment",            # Matin / Après-midi / Journée / Heure précise
+    "Date fin",          # pour les vacances sur plusieurs jours (sinon vide)
 ]
 COL_ID = COLONNES.index("ID") + 1
 
@@ -133,6 +192,10 @@ def _ws():
         ws = classeur.worksheet(ONGLET_PLANNING)
     except gspread.WorksheetNotFound:
         ws = classeur.add_worksheet(title=ONGLET_PLANNING, rows=1000, cols=len(COLONNES))
+
+    # Assez de colonnes dans la feuille pour les nouvelles colonnes
+    if ws.col_count < len(COLONNES):
+        ws.add_cols(len(COLONNES) - ws.col_count)
 
     entetes = ws.row_values(1)
     if not entetes:
@@ -242,7 +305,36 @@ def charger():
 
     # On garde uniquement les lignes exploitables
     df = df[df["_date"].notna() & df["_debut"].notna() & df["_fin"].notna()].copy()
+
+    # Date de fin (vacances) : vide → même jour
+    fin = pd.to_datetime(df["Date fin"], format="%d/%m/%Y", errors="coerce").dt.date
+    df["_date_fin"] = [f if pd.notna(f) and f >= d else d for f, d in zip(fin, df["_date"])]
+
+    # Anciennes lignes sans "Moment" : on considère une heure précise
+    df["Moment"] = df["Moment"].replace("", "Heure précise")
     return df
+
+
+def etaler(df):
+    """
+    Un rdv sur plusieurs jours (vacances du 1er au 10) devient une ligne
+    par jour, pour l'affichage et la détection des chevauchements.
+    Ajoute "_premier" : True le premier jour (on y écrit le titre).
+    """
+    if df.empty:
+        out = df.copy()
+        out["_premier"] = pd.Series(dtype=bool)
+        return out
+    lignes = []
+    for r in df.to_dict("records"):
+        jour, dernier = r["_date"], r["_date_fin"]
+        while jour <= dernier:
+            copie = dict(r)
+            copie["_date"] = jour
+            copie["_premier"] = (jour == r["_date"])
+            lignes.append(copie)
+            jour += timedelta(days=1)
+    return pd.DataFrame(lignes)
 
 
 def enregistrer(ligne):
@@ -314,26 +406,55 @@ def duree_en_minutes(txt):
     return int(h) * 60 + int(m)
 
 
-def carte_rdv(r, en_conflit=False):
-    """Carte HTML d'un rdv dans le planning."""
-    cat = CATEGORIES.get(r["Catégorie"], CATEGORIES["Autre"])
-    bordure = "#C0392B" if en_conflit else cat["couleur"]
-    fond = "#FDECEA" if en_conflit else cat["fond"]
-    alerte = (
-        "<div style='color:#C0392B;font-weight:700;font-size:0.85rem;margin-top:4px;'>"
-        "⚠️ Chevauche un autre rdv</div>"
-        if en_conflit else ""
-    )
-    lieu = f"<div style='font-size:0.85rem;opacity:0.8;'>📍 {escape(r['Lieu'])}</div>" if r["Lieu"].strip() else ""
-    notes = f"<div style='font-size:0.8rem;opacity:0.7;'>📝 {escape(r['Notes'])}</div>" if r["Notes"].strip() else ""
+def couleur_rdv(r):
+    """
+    Couleur de fond d'un rdv : celle du client pour un rdv Client
+    (comme dans l'agenda Excel), sinon celle de la catégorie.
+    """
+    if r.get("Catégorie") == "Client":
+        nom = str(r.get("Client", "") or r.get("Titre", "")).strip().lower()
+        if nom:
+            if nom in COULEURS_CLIENTS:
+                return COULEURS_CLIENTS[nom]
+            for cle, couleur in COULEURS_CLIENTS.items():
+                if cle in nom:                       # "Holcim Eclépens" → holcim
+                    return couleur
+            # Client inconnu : couleur fixe tirée de la palette d'après son nom
+            return PALETTE_AUTO[sum(map(ord, nom)) % len(PALETTE_AUTO)]
+    return CATEGORIES.get(r.get("Catégorie"), CATEGORIES["Autre"])["couleur"]
 
-    return (
-        f"<div class='rdv-card' style='background:{fond};border-left:6px solid {bordure};'>"
-        f"<div style='display:flex;justify-content:space-between;align-items:center;gap:8px;'>"
-        f"<span style='font-weight:700;font-size:1.05rem;'>{cat['emoji']} {escape(r['Titre'])}</span>"
-        f"<span style='font-weight:700;color:{bordure};white-space:nowrap;'>{r['Début']} – {r['Fin']}</span>"
-        f"</div>{lieu}{notes}{alerte}</div>"
-    )
+
+def texte_lisible(fond):
+    """Texte blanc sur fond foncé, texte foncé sur fond clair."""
+    fond = fond.lstrip("#")
+    r, g, b = (int(fond[i:i + 2], 16) for i in (0, 2, 4))
+    return "#FFFFFF" if (0.299 * r + 0.587 * g + 0.114 * b) < 140 else "#1B1F3B"
+
+
+def assombrir(couleur, facteur=0.75):
+    """Version plus foncée d'une couleur (pour les bordures)."""
+    c = couleur.lstrip("#")
+    r, g, b = (int(int(c[i:i + 2], 16) * facteur) for i in (0, 2, 4))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def infobulle(e):
+    """Texte affiché au survol d'un rdv (sur ordinateur)."""
+    if e.get("Moment") in ("Matin", "Après-midi", "Journée"):
+        quand = e["Moment"]
+    else:
+        quand = f"{e['Début']}–{e['Fin']}"
+    date_fin = str(e.get("Date fin", "")).strip()
+    if date_fin and date_fin != e["Date"]:
+        quand = f"du {e['Date']} au {date_fin}"
+    infos = f"{e['Titre']} · {quand}"
+    if str(e.get("Type prestation", "")).strip():
+        infos += f" · {e['Type prestation']}"
+    if str(e.get("Lieu", "")).strip():
+        infos += f" · 📍 {e['Lieu']}"
+    if str(e.get("Notes", "")).strip():
+        infos += f" · {e['Notes']}"
+    return escape(infos.replace("\n", " "), quote=True)
 
 
 # =============================================================================
@@ -341,14 +462,16 @@ def carte_rdv(r, en_conflit=False):
 # =============================================================================
 # >>> PERSONNALISATION — TAILLE ET PLAGE DU CALENDRIER
 #
-#   PX_PAR_HEURE   : hauteur d'une heure en pixels (plus grand = plus aéré)
+#   PX_PAR_HEURE         : hauteur d'une heure en pixels sur ordinateur
+#   PX_PAR_HEURE_MOBILE  : hauteur d'une heure sur téléphone
 #   CAL_HEURE_MIN  : première heure affichée (si aucun rdv plus tôt)
 #   CAL_HEURE_MAX  : dernière heure affichée (si aucun rdv plus tard)
 # =============================================================================
 
-PX_PAR_HEURE = 60
-CAL_HEURE_MIN = 7
-CAL_HEURE_MAX = 20
+PX_PAR_HEURE = 60          # sur ordinateur
+PX_PAR_HEURE_MOBILE = 40   # sur téléphone (plus compact)
+CAL_HEURE_MIN = 8
+CAL_HEURE_MAX = 18
 
 
 def _placer_cote_a_cote(evenements):
@@ -385,76 +508,75 @@ def _placer_cote_a_cote(evenements):
     return resultat
 
 
-def calendrier_semaine(semaine, lundi, conflits):
-    """Construit le HTML du calendrier de la semaine (lundi → dimanche)."""
-    # Plage horaire : 7h-20h, élargie si un rdv dépasse
+def _h(heures):
+    """Position verticale : un nombre d'heures × la hauteur d'une heure (variable CSS --h)."""
+    return f"calc(var(--h) * {heures:.4f})"
+
+
+def calendrier(rdv, premier_jour, nb_jours, conflits):
+    """
+    Construit le HTML du calendrier : nb_jours colonnes à partir de premier_jour.
+    La hauteur d'une heure vient de la variable CSS --h (plus petite sur téléphone).
+    """
+    # Plage horaire : 8h-18h, élargie si un rdv dépasse
     h0, h1 = CAL_HEURE_MIN, CAL_HEURE_MAX
-    if not semaine.empty:
-        h0 = min(h0, int(semaine["_debut"].min()) // 60)
-        h1 = max(h1, -(-int(semaine["_fin"].max()) // 60))  # arrondi à l'heure du dessus
-    hauteur = (h1 - h0) * PX_PAR_HEURE
+    if not rdv.empty:
+        h0 = min(h0, int(rdv["_debut"].min()) // 60)
+        h1 = max(h1, -(-int(rdv["_fin"].max()) // 60))  # arrondi à l'heure du dessus
+    hauteur = _h(h1 - h0)
     aujourdhui = date.today()
+    jours = [premier_jour + timedelta(days=i) for i in range(nb_jours)]
 
     # Colonne des heures
     heures = "".join(
-        f"<div class='cal-heure' style='top:{(h - h0) * PX_PAR_HEURE}px'>{h:02d}:00</div>"
+        f"<div class='cal-heure' style='top:{_h(h - h0)}'>{h:02d}:00</div>"
         for h in range(h0, h1)
     )
+    classe_cal = "cal cal-7" if nb_jours == 7 else "cal"
     html = [
-        "<div class='cal-scroll'><div class='cal'>",
+        f"<div class='cal-scroll'><div class='{classe_cal}'>",
         "<div class='cal-ligne-entete'><div class='cal-coin'></div>",
     ]
 
     # En-têtes des jours
-    for i in range(7):
-        jour = lundi + timedelta(days=i)
+    for jour in jours:
         classe = "cal-entete aujourdhui" if jour == aujourdhui else "cal-entete"
+        nom = JOURS[jour.weekday()] if nb_jours == 1 else JOURS[jour.weekday()][:3]
         html.append(
-            f"<div class='{classe}'><div class='cal-entete-jour'>{JOURS[i][:3].capitalize()}</div>"
+            f"<div class='{classe}'><div class='cal-entete-jour'>{nom.capitalize()}</div>"
             f"<div class='cal-entete-num'>{jour.day}</div></div>"
         )
     html.append("</div>")
 
-    # Corps : colonne des heures + 7 colonnes de jours
-    html.append(f"<div class='cal-corps'><div class='cal-heures' style='height:{hauteur}px'>{heures}</div>")
+    # Corps : colonne des heures + une colonne par jour
+    html.append(f"<div class='cal-corps'><div class='cal-heures' style='height:{hauteur}'>{heures}</div>")
 
-    for i in range(7):
-        jour = lundi + timedelta(days=i)
+    for jour in jours:
         classes = "cal-jour"
         if jour == aujourdhui:
             classes += " aujourdhui"
-        elif i >= 5:
+        elif jour.weekday() >= 5:
             classes += " weekend"
-        html.append(
-            f"<div class='{classes}' style='height:{hauteur}px;background-size:100% {PX_PAR_HEURE}px'>"
-        )
+        html.append(f"<div class='{classes}' style='height:{hauteur}'>")
 
-        du_jour = semaine[semaine["_date"] == jour].to_dict("records") if not semaine.empty else []
+        du_jour = rdv[rdv["_date"] == jour].to_dict("records") if not rdv.empty else []
         for e in _placer_cote_a_cote(du_jour):
             cat = CATEGORIES.get(e["Catégorie"], CATEGORIES["Autre"])
             en_conflit = e["ID"] in conflits
-            bordure = "#C0392B" if en_conflit else cat["couleur"]
-            fond = "#FDECEA" if en_conflit else cat["fond"]
+            fond = couleur_rdv(e)
+            texte = texte_lisible(fond)
+            bordure = "#C0392B" if en_conflit else assombrir(fond)
 
-            top = (e["_debut"] - h0 * 60) / 60 * PX_PAR_HEURE
-            haut = max((e["_fin"] - e["_debut"]) / 60 * PX_PAR_HEURE - 2, 22)
+            debut_h = (e["_debut"] - h0 * 60) / 60
+            duree_h = (e["_fin"] - e["_debut"]) / 60
             largeur = 100 / e["nb_pistes"]
             gauche = e["piste"] * largeur
+            infos = infobulle(e)
 
-            # Infobulle (au survol, sur ordinateur)
-            infos = f"{e['Début']}–{e['Fin']} · {e['Titre']}"
-            if str(e.get("Type prestation", "")).strip():
-                infos += f" · {e['Type prestation']}"
-            if str(e["Lieu"]).strip():
-                infos += f" · 📍 {e['Lieu']}"
-            if str(e["Notes"]).strip():
-                infos += f" · {e['Notes']}"
-            infos = escape(infos.replace("\n", " "), quote=True)
-
-            etroit = e["nb_pistes"] > 1  # rdv affiché côte à côte avec un autre
-
+            # Peu de place (rdv côte à côte, ou 7 jours sur un petit écran) :
+            # la classe "etroit" réduit le texte
+            etroit = e["nb_pistes"] > 1
             if etroit:
-                # Peu de place : juste l'heure de début et le titre
                 horaire = e["Début"]
                 titre_html = escape(e["Titre"])
                 lieu = ""
@@ -464,15 +586,17 @@ def calendrier_semaine(semaine, lundi, conflits):
                 titre_html = f"{cat['emoji']} {escape(e['Titre'])}"
                 lieu = (
                     f"<div class='cal-evt-l'>📍 {escape(e['Lieu'])}</div>"
-                    if str(e["Lieu"]).strip() and haut > 50 else ""
+                    if str(e["Lieu"]).strip() and duree_h >= 1 else ""
                 )
 
             classe_evt = "cal-evt etroit" if etroit else "cal-evt"
             html.append(
-                f"<div class='{classe_evt}' title=\"{infos}\" style='top:{top:.0f}px;height:{haut:.0f}px;"
+                f"<div class='{classe_evt}' title=\"{infos}\" style='top:{_h(debut_h)};"
+                f"height:calc(var(--h) * {duree_h:.4f} - 2px);"
                 f"left:calc({gauche:.2f}% + 2px);width:calc({largeur:.2f}% - 4px);"
-                f"background:{fond};border-left:4px solid {bordure};'>"
-                f"<div class='cal-evt-h' style='color:{bordure}'>{horaire}</div>"
+                f"background:{fond};color:{texte};border-left:4px solid {bordure};"
+                f"{'box-shadow:inset 0 0 0 2px #C0392B;' if en_conflit else ''}'>"
+                f"<div class='cal-evt-h'>{horaire}</div>"
                 f"<div class='cal-evt-t'>{titre_html}</div>{lieu}</div>"
             )
 
@@ -481,13 +605,127 @@ def calendrier_semaine(semaine, lundi, conflits):
             minutes = datetime.now().hour * 60 + datetime.now().minute
             if h0 * 60 <= minutes < h1 * 60:
                 html.append(
-                    f"<div class='cal-maintenant' style='top:{(minutes - h0 * 60) / 60 * PX_PAR_HEURE:.0f}px'></div>"
+                    f"<div class='cal-maintenant' style='top:{_h((minutes - h0 * 60) / 60)}'></div>"
                 )
 
         html.append("</div>")
 
     html.append("</div></div></div>")
     return "".join(html)
+
+
+# =============================================================================
+# 6c. VUE MOIS (façon agenda Excel)
+# =============================================================================
+# Une colonne par mois, une ligne par jour, deux demi-cases :
+#   en haut le matin, en bas l'après-midi.
+# Dimanches grisés, aujourd'hui en vert, numéro de semaine à côté des lundis.
+# =============================================================================
+
+JOURS_COURTS = ["LUN", "MAR", "MER", "JEU", "VEN", "SAM", "D"]
+
+
+def _blocs_du_jour(evenements, conflits):
+    """
+    Place les rdv d'un jour dans les deux demi-cases (grille CSS) :
+      - un rdv qui couvre matin ET après-midi occupe les deux lignes ;
+      - les autres sont rangés côte à côte dans leur demi-case.
+    """
+    complets, matins, aprems = [], [], []
+    for e in sorted(evenements, key=lambda x: (x["_debut"], x["_fin"])):
+        au_matin = e["_debut"] < MIDI
+        l_aprem = e["_fin"] > MIDI
+        if au_matin and l_aprem:
+            complets.append(e)
+        elif au_matin:
+            matins.append(e)
+        else:
+            aprems.append(e)
+
+    places = []  # (rdv, colonne, lignes CSS)
+    col = 1
+    for e in complets:
+        places.append((e, col, "1 / 3"))
+        col += 1
+    for k in range(max(len(matins), len(aprems))):
+        if k < len(matins):
+            places.append((matins[k], col, "1"))
+        if k < len(aprems):
+            places.append((aprems[k], col, "2"))
+        col += 1
+    nb_colonnes = col - 1
+
+    html = []
+    for e, c, lignes in places:
+        fond = couleur_rdv(e)
+        texte = texte_lisible(fond)
+        en_conflit = e["ID"] in conflits
+        classe = "blk conflit" if en_conflit else "blk"
+        # Rdv sur plusieurs jours : le titre seulement le 1er jour (bande continue ensuite)
+        multi = str(e.get("Date fin", "")).strip() not in ("", e["Date"])
+        if multi and not e.get("_premier", True):
+            libelle = ""
+            classe += " suite"
+        else:
+            libelle = ("⚠️ " if en_conflit else "") + escape(e["Titre"])
+            if e.get("Moment") == "Heure précise":
+                libelle = f"<b>{e['Début']}</b>&nbsp;{libelle}"
+        html.append(
+            f"<div class='{classe}' title=\"{infobulle(e)}\" "
+            f"style='grid-column:{c};grid-row:{lignes};background:{fond};color:{texte};'>"
+            f"<span>{libelle}</span></div>"
+        )
+    return nb_colonnes, "".join(html)
+
+
+def vue_mois(rdv, annee, mois, conflits, classe_sup=""):
+    """HTML d'un mois façon agenda Excel."""
+    aujourdhui = date.today()
+    premier = date(annee, mois, 1)
+    nb_jours = (date(annee + (mois == 12), mois % 12 + 1, 1) - premier).days
+
+    # Rdv du mois rangés par jour
+    par_jour = {}
+    if not rdv.empty:
+        dans_mois = rdv[(rdv["_date"] >= premier) & (rdv["_date"] < premier + timedelta(days=nb_jours))]
+        for e in dans_mois.to_dict("records"):
+            par_jour.setdefault(e["_date"], []).append(e)
+
+    html = [f"<div class='mois {classe_sup}'><div class='mois-titre'>{MOIS[mois - 1]} {annee}</div>"]
+    for i in range(nb_jours):
+        jour = premier + timedelta(days=i)
+        classes = "jr"
+        if jour.weekday() == 6:
+            classes += " dim"
+        if jour == aujourdhui:
+            classes += " auj"
+        nb_col, blocs = _blocs_du_jour(par_jour.get(jour, []), conflits)
+        grille = f"grid-template-columns:repeat({nb_col}, minmax(0, 1fr));" if nb_col else ""
+        semaine = jour.isocalendar()[1] if jour.weekday() == 0 else ""
+        html.append(
+            f"<div class='{classes}'>"
+            f"<div class='jr-nom'>{JOURS_COURTS[jour.weekday()]}</div>"
+            f"<div class='jr-num'>{jour.day}</div>"
+            f"<div class='jr-slots' style='{grille}'>{blocs}</div>"
+            f"<div class='jr-sem'>{semaine}</div>"
+            f"</div>"
+        )
+    html.append("</div>")
+    return "".join(html)
+
+
+def vue_plusieurs_mois(rdv, annee, mois, conflits, nb=3):
+    """
+    Plusieurs mois côte à côte (3 sur ordinateur).
+    Sur téléphone, le CSS ne garde que le premier.
+    """
+    blocs = []
+    for k in range(nb):
+        m = (mois - 1 + k) % 12 + 1
+        a = annee + (mois - 1 + k) // 12
+        classe = "" if k == 0 else f"mois-sup mois-{k + 1}"
+        blocs.append(vue_mois(rdv, a, m, conflits, classe))
+    return f"<div class='mois-grille'>{''.join(blocs)}</div>"
 
 
 # =============================================================================
@@ -594,10 +832,11 @@ st.markdown(
       /* ---------------- CALENDRIER DE LA SEMAINE ---------------- */
       .cal-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; margin-top: 10px; }
       .cal {
-          min-width: 700px; background: #FFFFFF; border-radius: 16px;
+          background: #FFFFFF; border-radius: 16px;
           border: 2px solid #D8E6F5; padding: 8px 8px 12px 0;
           box-shadow: 0 4px 14px rgba(61, 82, 160, 0.08);
       }
+      .cal-7 { min-width: 640px; }   /* la semaine entière garde une largeur minimale */
       .cal-ligne-entete { display: flex; margin-bottom: 6px; }
       .cal-coin { width: 52px; flex: none; }
       .cal-entete { flex: 1; text-align: center; padding: 6px 0; border-radius: 10px; color: #3D52A0; }
@@ -614,11 +853,12 @@ st.markdown(
       .cal-jour {
           flex: 1; position: relative; border-left: 1px solid #E6E0F2;
           background-image: linear-gradient(to bottom, #E6E0F2 1px, transparent 1px);
+          background-size: 100% var(--h);
       }
       .cal-jour.weekend { background-color: #FAF8FD; }
       .cal-jour.aujourdhui { background-color: #F2FAF3; }
       .cal-evt {
-          position: absolute; box-sizing: border-box; border-radius: 8px;
+          position: absolute; box-sizing: border-box; border-radius: 8px; min-height: 20px;
           padding: 3px 6px; overflow: hidden; color: #1B1F3B;
           box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08); cursor: default;
           animation: glisse .4s ease-out both;
@@ -642,6 +882,44 @@ st.markdown(
       .cal-legende { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; font-size: 0.9rem; }
       .cal-legende span { display: inline-flex; align-items: center; gap: 6px; }
       .cal-legende i { width: 14px; height: 14px; border-radius: 4px; display: inline-block; }
+
+      /* ---------------- VUE MOIS (façon agenda Excel) ---------------- */
+      .mois-grille {
+          display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 12px; margin-top: 10px;
+      }
+      .mois {
+          background: #FFFFFF; border: 2px solid #D8E6F5; border-radius: 14px;
+          overflow: hidden; box-shadow: 0 4px 14px rgba(61, 82, 160, 0.08);
+      }
+      .mois-titre {
+          text-align: center; color: #2E8BD6; font-weight: 800; font-size: 1.2rem;
+          letter-spacing: .05em; text-transform: uppercase; padding: 8px 0;
+          border-bottom: 2px solid #D8E6F5;
+      }
+      .jr {
+          display: grid; grid-template-columns: 34px 28px minmax(0, 1fr) 24px;
+          min-height: 38px; border-bottom: 1px solid #EFEFEF;
+      }
+      .jr-nom, .jr-num, .jr-sem { display: flex; align-items: center; justify-content: center; }
+      .jr-nom { font-size: .66rem; font-weight: 600; color: #444; }
+      .jr-num { font-size: .9rem; font-weight: 700; color: #1B1F3B; background: #E9EEF5; }
+      .jr-sem { font-size: .7rem; color: #555; }
+      .jr-slots {
+          display: grid; grid-template-rows: 1fr 1fr; column-gap: 2px; row-gap: 1px;
+          padding: 1px 3px; min-width: 0;
+      }
+      .jr.dim { background: #D3D3D3; }
+      .jr.dim .jr-nom, .jr.dim .jr-num { background: #8DB8F0; color: #FFFFFF; }
+      .jr.auj .jr-num { background: #8EE68E; color: #084E00; }
+      .jr.auj { background: #F2FAF3; }
+      .blk {
+          display: flex; align-items: center; min-width: 0; border-radius: 3px;
+          padding: 0 4px; font-size: .7rem; font-weight: 600; cursor: default;
+      }
+      .blk span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .blk.conflit { box-shadow: inset 0 0 0 2px #C0392B; }
+      .blk.suite { border-radius: 0; }
 
       /* En-tête de chaque jour */
       .jour-titre {
@@ -755,8 +1033,27 @@ st.markdown(
       [data-testid="stTab"][aria-selected="true"] p { color: #2F2A44 !important; }
       .react-aria-SelectionIndicator { display: none !important; }
 
+      /* Tablette : 2 mois côte à côte */
+      @media (max-width: 900px) {
+          .mois-grille { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+          .mois-3 { display: none; }
+      }
+
       /* Mobile */
       @media (max-width: 640px) {
+          .mois-grille { grid-template-columns: 1fr; }
+          .mois-sup { display: none; }
+          .jr { min-height: 40px; }
+          .blk { font-size: .78rem; }
+          .cal { padding: 6px 4px 10px 0; border-radius: 12px; }
+          .cal-coin, .cal-heures { width: 40px; }
+          .cal-heure { font-size: 0.65rem; right: 5px; }
+          .cal-entete-jour { font-size: 0.7rem; }
+          .cal-entete-num { font-size: 1.05rem; }
+          .cal-evt { padding: 2px 4px; border-radius: 6px; }
+          .cal-evt-h { font-size: 0.62rem; }
+          .cal-evt-t { font-size: 0.75rem; }
+          .cal-evt-l { display: none; }
           [data-testid="stAppViewContainer"] h1 { font-size: 26px !important; }
           .stButton > button p { font-size: 1.1rem !important; padding: 0.8rem 1.5rem !important; }
           [data-testid="stTab"] { padding: 10px 12px !important; }
@@ -765,6 +1062,15 @@ st.markdown(
       }
     </style>
     """,
+    unsafe_allow_html=True,
+)
+
+# Hauteur d'une heure dans le calendrier (variable CSS --h)
+st.markdown(
+    f"""<style>
+      .cal {{ --h: {PX_PAR_HEURE}px; }}
+      @media (max-width: 640px) {{ .cal {{ --h: {PX_PAR_HEURE_MOBILE}px; }} }}
+    </style>""",
     unsafe_allow_html=True,
 )
 
@@ -801,7 +1107,7 @@ st.markdown(
                 padding: 22px 24px; border-radius: 16px; margin-bottom: 40px; text-align:center;">
       <h1 style="color:#ffffff !important; margin:0; font-size:40px;">📅 Mon planning</h1>
       <p style="color:#EDE8F5; margin:6px 0 0; font-size:18px;">
-          Rendez-vous • Semaine • Chevauchements
+          Agenda • Clients • Vacances
       </p>
     </div>
     """,
@@ -853,70 +1159,126 @@ try:
 except Exception as e:
     st.error("Impossible de lire le Google Sheet (partage en Éditeur ?).")
     st.caption(f"Détail technique : {e}")
-    df = pd.DataFrame(columns=COLONNES + ["_date", "_debut", "_fin"])
+    df = pd.DataFrame(columns=COLONNES + ["_date", "_debut", "_fin", "_date_fin"])
 
-conflits_globaux = ids_en_conflit(df) if not df.empty else set()
+# Une ligne par jour (les vacances sur 10 jours deviennent 10 lignes)
+df_jours = etaler(df)
+conflits_globaux = ids_en_conflit(df_jours) if not df_jours.empty else set()
 
 tab_planning, tab_ajout, tab_liste = st.tabs([
-    "📅 Ma semaine",
+    "📅 Calendrier",
     "➕ Nouveau rdv",
     "🔎 Tous les rdv",
 ])
 
 
 # =============================================================================
-# 12. ONGLET : MA SEMAINE
+# 12. ONGLET : CALENDRIER
 # =============================================================================
 
 with tab_planning:
 
-    # Lundi de la semaine affichée (mémorisé entre deux clics)
-    if "lundi" not in st.session_state:
-        st.session_state["lundi"] = date.today() - timedelta(days=date.today().weekday())
+    # ── Choix de l'affichage ───────────────────────────────────────────
+    # Le lien peut imposer l'affichage par défaut : ?vue=semaine ou ?vue=jour
+    VUES = {"mois": "🗓️ Mois", "semaine": "📅 Semaine", "jour": "📆 Jour"}
 
-    c1, c2, c3 = st.columns(3)
-    if c1.button("◀ Précédente", key="nav_prec", use_container_width=True):
-        st.session_state["lundi"] -= timedelta(days=7)
-        st.rerun()
-    if c2.button("Aujourd'hui", key="nav_auj", use_container_width=True):
-        st.session_state["lundi"] = date.today() - timedelta(days=date.today().weekday())
-        st.rerun()
-    if c3.button("Suivante ▶", key="nav_suiv", use_container_width=True):
-        st.session_state["lundi"] += timedelta(days=7)
-        st.rerun()
+    if "vue" not in st.session_state:
+        vue_lien = str(st.query_params.get("vue", "mois"))
+        st.session_state["vue"] = vue_lien if vue_lien in VUES else "mois"
 
-    lundi = st.session_state["lundi"]
-    dimanche = lundi + timedelta(days=6)
-    st.markdown(
-        f"### Semaine du {lundi.day} {MOIS[lundi.month - 1]} "
-        f"au {dimanche.day} {MOIS[dimanche.month - 1]} {dimanche.year}"
+    vue = st.radio(
+        "Affichage",
+        list(VUES.keys()),
+        format_func=lambda v: VUES[v],
+        horizontal=True,
+        key="vue",
+        label_visibility="collapsed",
     )
 
-    semaine = df[(df["_date"] >= lundi) & (df["_date"] <= dimanche)] if not df.empty else df
-    nb_conflits = len(set(semaine["ID"]) & conflits_globaux) if not semaine.empty else 0
+    # Date de référence (mémorisée entre deux clics)
+    if "date_ref" not in st.session_state:
+        st.session_state["date_ref"] = date.today()
+
+    def decaler(sens):
+        """Avance (+1) ou recule (-1) d'un mois, d'une semaine ou d'un jour."""
+        ref = st.session_state["date_ref"]
+        if vue == "mois":
+            m = ref.month - 1 + sens
+            st.session_state["date_ref"] = date(ref.year + m // 12, m % 12 + 1, 1)
+        else:
+            st.session_state["date_ref"] = ref + timedelta(days=7 * sens if vue == "semaine" else sens)
+
+    c1, c2, c3 = st.columns(3)
+    if c1.button("◀ Précédent", key="nav_prec", use_container_width=True):
+        decaler(-1)
+        st.rerun()
+    if c2.button("Aujourd'hui", key="nav_auj", use_container_width=True):
+        st.session_state["date_ref"] = date.today()
+        st.rerun()
+    if c3.button("Suivant ▶", key="nav_suiv", use_container_width=True):
+        decaler(+1)
+        st.rerun()
+
+    ref = st.session_state["date_ref"]
+
+    # Période affichée
+    if vue == "mois":
+        premier = date(ref.year, ref.month, 1)
+        m = ref.month - 1 + 3   # 3 mois affichés sur ordinateur
+        dernier = date(ref.year + m // 12, m % 12 + 1, 1) - timedelta(days=1)
+        titre_periode = None   # chaque mois a son propre titre
+    elif vue == "semaine":
+        premier = ref - timedelta(days=ref.weekday())   # lundi
+        dernier = premier + timedelta(days=6)
+        titre_periode = (f"Semaine du {premier.day} {MOIS[premier.month - 1]} "
+                         f"au {dernier.day} {MOIS[dernier.month - 1]} {dernier.year}")
+    else:
+        premier = dernier = ref
+        titre_periode = date_en_lettres(ref).capitalize()
+
+    if titre_periode:
+        st.markdown(f"### {titre_periode}")
+
+    periode = (df_jours[(df_jours["_date"] >= premier) & (df_jours["_date"] <= dernier)]
+               if not df_jours.empty else df_jours)
+    nb_conflits = len(set(periode["ID"]) & conflits_globaux) if not periode.empty else 0
 
     if nb_conflits:
         st.markdown(
-            f"<div class='alerte-conflit'>⚠️ Attention : {nb_conflits} rdv se chevauchent cette semaine "
-            f"(en rouge ci-dessous).</div>",
+            f"<div class='alerte-conflit'>⚠️ Attention : {nb_conflits} rdv se chevauchent "
+            f"sur cette période (encadrés en rouge).</div>",
             unsafe_allow_html=True,
         )
 
     # ── Le calendrier ──────────────────────────────────────────────────
-    st.markdown(calendrier_semaine(semaine, lundi, conflits_globaux), unsafe_allow_html=True)
+    if vue == "mois":
+        st.markdown(vue_plusieurs_mois(periode, ref.year, ref.month, conflits_globaux),
+                    unsafe_allow_html=True)
+    else:
+        st.markdown(calendrier(periode, premier, 7 if vue == "semaine" else 1, conflits_globaux),
+                    unsafe_allow_html=True)
 
-    # ── Légende des couleurs ───────────────────────────────────────────
+    # ── Légende : les clients visibles + les catégories ───────────────
+    vus = {}
+    if not periode.empty:
+        for e in periode.drop_duplicates("ID").to_dict("records"):
+            if e["Catégorie"] == "Client":
+                nom = str(e.get("Client") or e["Titre"]).strip()
+                vus.setdefault(nom, couleur_rdv(e))
     legende = "".join(
-        f"<span><i style='background:{c['fond']};border-left:4px solid {c['couleur']}'></i>"
-        f"{c['emoji']} {nom}</span>"
-        for nom, c in CATEGORIES.items()
+        f"<span><i style='background:{coul}'></i>{escape(nom)}</span>" for nom, coul in sorted(vus.items())
     )
-    legende += "<span><i style='background:#FDECEA;border-left:4px solid #C0392B'></i>⚠️ Chevauchement</span>"
+    legende += "".join(
+        f"<span><i style='background:{c['couleur']}'></i>{c['emoji']} {nom}</span>"
+        for nom, c in CATEGORIES.items() if nom != "Client"
+    )
+    legende += "<span><i style='background:#FFFFFF;box-shadow:inset 0 0 0 2px #C0392B'></i>⚠️ Chevauchement</span>"
     st.markdown(f"<div class='cal-legende'>{legende}</div>", unsafe_allow_html=True)
 
-    if semaine.empty:
-        st.caption("Rien de prévu cette semaine 🌿")
-    st.caption("📱 Sur téléphone, fais glisser le calendrier vers la gauche pour voir toute la semaine.")
+    if periode.empty:
+        st.caption("Rien de prévu sur cette période 🌿")
+    if vue == "semaine":
+        st.caption("📱 Sur téléphone, la vue « Mois » ou « Jour » est plus confortable.")
 
 
 # =============================================================================
@@ -1020,41 +1382,76 @@ with tab_ajout:
         titre = f"{client} — {precision.strip()}" if precision.strip() else client
         lieu_defaut = lieu_du_client(fiche)
 
+    elif categorie in ("Libre", "Vacances"):
+        # Titre facultatif : "Libre" / "Vacances" par défaut
+        precision = st.text_input(
+            "📝 **Étape 2 — Une précision ?** (facultatif)",
+            placeholder="Ex : Maroc, Paris, temps pour moi…",
+            key="saisie_titre",
+        ).strip()
+        titre = f"{categorie} — {precision}" if precision else categorie
+
     else:
         titre = st.text_input(
             "📝 **Étape 2 — C'est quoi ?**",
-            placeholder="Ex : Dr Eich, dentiste, coiffeur…",
+            placeholder="Ex : Dr Eich, RDZ urologue, permis…",
             key="saisie_titre",
         )
 
     st.divider()
-    jour = st.date_input(
-        "📅 **Étape 3 — Quel jour ?**",
-        value=date.today(),
-        format="DD/MM/YYYY",
-        key="saisie_date",
-    )
-    st.caption(f"👉 Tu as choisi : **{date_en_lettres(jour)}**")
+    plusieurs_jours = categorie in CATEGORIES_PLUSIEURS_JOURS
 
-    st.divider()
-    col_h, col_d = st.columns(2)
-    debut_txt = col_h.selectbox(
-        "🕘 **À quelle heure ?**",
-        HORAIRES,
-        index=HORAIRES.index("09:00"),
-        key="saisie_debut",
-    )
-    duree_txt = col_d.selectbox(
-        "⏱️ **Combien de temps ?**",
-        DUREES,
-        index=DUREES.index("1h00"),
-        key="saisie_duree",
-    )
+    if plusieurs_jours:
+        # ── Vacances : du … au …
+        st.markdown("📅 **Étape 3 — Quelles dates ?**")
+        c_du, c_au = st.columns(2)
+        jour = c_du.date_input("Du", value=date.today(), format="DD/MM/YYYY", key="saisie_date")
+        jour_fin = c_au.date_input("Au", value=jour, min_value=jour, format="DD/MM/YYYY",
+                                   key=f"saisie_date_fin_{jour}")
+        nb = (jour_fin - jour).days + 1
+        st.caption(f"👉 Du **{date_en_lettres(jour)}** au **{date_en_lettres(jour_fin)}** "
+                   f"({nb} jour{'s' if nb > 1 else ''})")
+        moment = "Journée"
+    else:
+        jour = st.date_input(
+            "📅 **Étape 3 — Quel jour ?**",
+            value=date.today(),
+            format="DD/MM/YYYY",
+            key="saisie_date",
+        )
+        jour_fin = jour
+        st.caption(f"👉 Tu as choisi : **{date_en_lettres(jour)}**")
 
-    debut = en_minutes(debut_txt)
-    fin = debut + duree_en_minutes(duree_txt)
-    fin_txt = en_heure(fin) if fin < 24 * 60 else "23:59"
-    st.caption(f"👉 De **{debut_txt}** à **{fin_txt}**")
+        st.divider()
+        moment = st.radio(
+            "🕘 **Étape 4 — À quel moment ?**",
+            list(MOMENTS.keys()),
+            format_func=lambda m: f"{MOMENTS[m]['emoji']} {m}",
+            horizontal=True,
+            key="saisie_moment",
+        )
+
+    if moment == "Heure précise":
+        col_h, col_d = st.columns(2)
+        debut_txt = col_h.selectbox(
+            "🕘 À quelle heure ?",
+            HORAIRES,
+            index=HORAIRES.index("09:00"),
+            key="saisie_debut",
+        )
+        duree_txt = col_d.selectbox(
+            "⏱️ Combien de temps ?",
+            DUREES,
+            index=DUREES.index("1h00"),
+            key="saisie_duree",
+        )
+        debut = en_minutes(debut_txt)
+        fin = debut + duree_en_minutes(duree_txt)
+        fin_txt = en_heure(fin) if fin < 24 * 60 else "23:59"
+        st.caption(f"👉 De **{debut_txt}** à **{fin_txt}**")
+    else:
+        debut_txt, fin_txt = MOMENTS[moment]["debut"], MOMENTS[moment]["fin"]
+        debut, fin = en_minutes(debut_txt), en_minutes(fin_txt)
 
     st.divider()
     lieu = st.text_input(
@@ -1066,15 +1463,21 @@ with tab_ajout:
 
     # ── Vérification en direct du créneau ──────────────────────────────
     st.divider()
-    chevauchements = rdv_en_conflit(df, jour, debut, fin) if not df.empty else df
+    jours_concernes = [jour + timedelta(days=i) for i in range((jour_fin - jour).days + 1)]
+    if df_jours.empty:
+        chevauchements = df_jours
+    else:
+        chevauchements = pd.concat(
+            [rdv_en_conflit(df_jours, j, debut, fin) for j in jours_concernes]
+        ).drop_duplicates("ID")
 
     if chevauchements.empty:
         st.markdown("<div class='ok-creneau'>✅ Créneau libre, aucun autre rdv à ce moment-là.</div>",
                     unsafe_allow_html=True)
     else:
         liste = "<br>".join(
-            f"• {escape(r['Titre'])} ({r['Début']} – {r['Fin']})"
-            for _, r in chevauchements.sort_values("_debut").iterrows()
+            f"• {r['_date'].strftime('%d/%m')} — {escape(r['Titre'])} ({r['Début']} – {r['Fin']})"
+            for _, r in chevauchements.sort_values(["_date", "_debut"]).iterrows()
         )
         st.markdown(
             f"<div class='alerte-conflit'>⚠️ Ce créneau chevauche :<br>{liste}</div>",
@@ -1083,6 +1486,8 @@ with tab_ajout:
 
     ligne = {
         "Date": jour.strftime("%d/%m/%Y"),
+        "Date fin": jour_fin.strftime("%d/%m/%Y") if jour_fin != jour else "",
+        "Moment": moment,
         "Début": debut_txt,
         "Fin": fin_txt,
         "Titre": titre.strip(),
@@ -1097,8 +1502,16 @@ with tab_ajout:
     def confirmer(ligne, nb_conflits, fiche_a_creer=None):
         cat = CATEGORIES[ligne["Catégorie"]]
         st.markdown(f"### {cat['emoji']} {ligne['Titre']}")
-        st.write(f"📅 {date_en_lettres(datetime.strptime(ligne['Date'], '%d/%m/%Y').date())}")
-        st.write(f"🕘 {ligne['Début']} – {ligne['Fin']}")
+        d1 = datetime.strptime(ligne["Date"], "%d/%m/%Y").date()
+        if ligne["Date fin"]:
+            d2 = datetime.strptime(ligne["Date fin"], "%d/%m/%Y").date()
+            st.write(f"📅 Du {date_en_lettres(d1)} au {date_en_lettres(d2)}")
+        else:
+            st.write(f"📅 {date_en_lettres(d1)}")
+            if ligne["Moment"] == "Heure précise":
+                st.write(f"🕘 {ligne['Début']} – {ligne['Fin']}")
+            else:
+                st.write(f"{MOMENTS[ligne['Moment']]['emoji']} {ligne['Moment']}")
         if ligne["Type prestation"]:
             st.write(f"{EMOJIS_PRESTATION.get(ligne['Type prestation'], '')} {ligne['Type prestation']}")
         if ligne["Lieu"]:
@@ -1167,9 +1580,9 @@ with tab_liste:
 
         vue = df.copy()
         if periode == "À venir":
-            vue = vue[vue["_date"] >= date.today()]
+            vue = vue[vue["_date_fin"] >= date.today()]
         elif periode == "Passés":
-            vue = vue[vue["_date"] < date.today()]
+            vue = vue[vue["_date_fin"] < date.today()]
         if recherche.strip():
             masque = vue[["Titre", "Client", "Lieu", "Notes"]].apply(
                 lambda col: col.str.contains(recherche, case=False, na=False)
@@ -1181,7 +1594,8 @@ with tab_liste:
 
         st.write(f"**{len(vue)} rendez-vous**")
         st.dataframe(
-            vue[["⚠️", "Date", "Début", "Fin", "Titre", "Catégorie", "Client", "Type prestation", "Lieu", "Notes"]],
+            vue[["⚠️", "Date", "Date fin", "Moment", "Début", "Fin", "Titre", "Catégorie",
+                 "Client", "Type prestation", "Lieu", "Notes"]],
             use_container_width=True,
             hide_index=True,
         )
