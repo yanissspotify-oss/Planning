@@ -7,6 +7,7 @@ from html import escape
 import random
 import uuid
 import re
+import hmac
 
 # =============================================================================
 # APPLICATION : PLANNING DES RENDEZ-VOUS
@@ -504,6 +505,53 @@ if "gcp_service_account" not in st.secrets:
         "La clé d'accès n'est pas configurée.\n\n"
         "Vérifie le fichier .streamlit/secrets.toml, puis relance l'application."
     )
+    st.stop()
+
+
+# =============================================================================
+# 7b. PROTECTION PAR MOT DE PASSE
+# =============================================================================
+# L'app est publique (n'importe qui ayant le lien peut l'ouvrir), donc on la
+# protège. Deux façons d'entrer :
+#   1. taper le mot de passe ;
+#   2. ouvrir le lien contenant la clé :  https://.../?cle=LE_MOT_DE_PASSE
+#      → pratique pour l'icône sur le téléphone : on ne tape jamais rien.
+#
+# Le mot de passe se règle dans les Secrets (jamais dans le code) :
+#   app_password = "..."
+# S'il n'est pas défini (en local par exemple), l'app reste ouverte.
+# =============================================================================
+
+def acces_autorise():
+    mot_de_passe = str(st.secrets.get("app_password", "")).strip()
+    if not mot_de_passe:
+        return True  # pas de mot de passe configuré → accès libre
+    if st.session_state.get("acces_ok"):
+        return True
+
+    # Entrée par le lien (?cle=...)
+    if hmac.compare_digest(str(st.query_params.get("cle", "")), mot_de_passe):
+        st.session_state["acces_ok"] = True
+        return True
+
+    # Sinon : petit écran de connexion
+    st.markdown(
+        "<div style='text-align:center;margin-top:60px;'>"
+        "<div style='font-size:3rem;'>📅🔒</div>"
+        "<h2 style='color:#3D52A0;'>Mon planning</h2></div>",
+        unsafe_allow_html=True,
+    )
+    saisie = st.text_input("Mot de passe", type="password", key="mdp_saisie")
+    if saisie:
+        if hmac.compare_digest(saisie.strip(), mot_de_passe):
+            st.session_state["acces_ok"] = True
+            st.rerun()
+        else:
+            st.error("Mot de passe incorrect 🙂")
+    return False
+
+
+if not acces_autorise():
     st.stop()
 
 
