@@ -1017,6 +1017,17 @@ st.markdown(
       }
       .st-key-ouvrir_suppression .stButton > button p { color: #842029 !important; }
 
+      /* Bouton « ➕ Nouveau rdv » au-dessus du calendrier */
+      .st-key-ouvrir_ajout .stButton > button p {
+          font-size: 1.35rem !important; padding: 0.5rem 1rem !important;
+          min-height: auto !important;
+      }
+      .st-key-ouvrir_ajout { margin-bottom: 10px; }
+
+      /* Fenêtre pop-up : titres de champs un peu plus petits */
+      [data-testid="stDialog"] [data-testid="stWidgetLabel"] p { font-size: 1.15rem !important; }
+      [data-testid="stDialog"] .st-key-valider_dialog .stButton > button p { font-size: 1.15rem !important; }
+
       /* Onglets */
       .stTabs [data-baseweb="tab-list"] { gap: 15px; }
       [data-testid="stTabs"] { margin-top: 35px !important; }
@@ -1165,127 +1176,22 @@ except Exception as e:
 df_jours = etaler(df)
 conflits_globaux = ids_en_conflit(df_jours) if not df_jours.empty else set()
 
-tab_planning, tab_ajout, tab_liste = st.tabs([
-    "📅 Calendrier",
-    "➕ Nouveau rdv",
-    "🔎 Tous les rdv",
-])
-
-
 # =============================================================================
-# 12. ONGLET : CALENDRIER
+# 11b. FENÊTRE « NOUVEAU RDV » (pop-up)
+# =============================================================================
+# S'ouvre avec le bouton « ➕ Nouveau rdv » au-dessus du calendrier.
+# Si on ferme la fenêtre avec la croix, ce qui a été tapé est gardé
+# pour la prochaine ouverture ; « Annuler » efface tout.
 # =============================================================================
 
-with tab_planning:
-
-    # ── Choix de l'affichage ───────────────────────────────────────────
-    # Le lien peut imposer l'affichage par défaut : ?vue=semaine ou ?vue=jour
-    VUES = {"mois": "🗓️ Mois", "semaine": "📅 Semaine", "jour": "📆 Jour"}
-
-    if "vue" not in st.session_state:
-        vue_lien = str(st.query_params.get("vue", "mois"))
-        st.session_state["vue"] = vue_lien if vue_lien in VUES else "mois"
-
-    vue = st.radio(
-        "Affichage",
-        list(VUES.keys()),
-        format_func=lambda v: VUES[v],
-        horizontal=True,
-        key="vue",
-        label_visibility="collapsed",
-    )
-
-    # Date de référence (mémorisée entre deux clics)
-    if "date_ref" not in st.session_state:
-        st.session_state["date_ref"] = date.today()
-
-    def decaler(sens):
-        """Avance (+1) ou recule (-1) d'un mois, d'une semaine ou d'un jour."""
-        ref = st.session_state["date_ref"]
-        if vue == "mois":
-            m = ref.month - 1 + sens
-            st.session_state["date_ref"] = date(ref.year + m // 12, m % 12 + 1, 1)
-        else:
-            st.session_state["date_ref"] = ref + timedelta(days=7 * sens if vue == "semaine" else sens)
-
-    c1, c2, c3 = st.columns(3)
-    if c1.button("◀ Précédent", key="nav_prec", use_container_width=True):
-        decaler(-1)
-        st.rerun()
-    if c2.button("Aujourd'hui", key="nav_auj", use_container_width=True):
-        st.session_state["date_ref"] = date.today()
-        st.rerun()
-    if c3.button("Suivant ▶", key="nav_suiv", use_container_width=True):
-        decaler(+1)
-        st.rerun()
-
-    ref = st.session_state["date_ref"]
-
-    # Période affichée
-    if vue == "mois":
-        premier = date(ref.year, ref.month, 1)
-        m = ref.month - 1 + 3   # 3 mois affichés sur ordinateur
-        dernier = date(ref.year + m // 12, m % 12 + 1, 1) - timedelta(days=1)
-        titre_periode = None   # chaque mois a son propre titre
-    elif vue == "semaine":
-        premier = ref - timedelta(days=ref.weekday())   # lundi
-        dernier = premier + timedelta(days=6)
-        titre_periode = (f"Semaine du {premier.day} {MOIS[premier.month - 1]} "
-                         f"au {dernier.day} {MOIS[dernier.month - 1]} {dernier.year}")
-    else:
-        premier = dernier = ref
-        titre_periode = date_en_lettres(ref).capitalize()
-
-    if titre_periode:
-        st.markdown(f"### {titre_periode}")
-
-    periode = (df_jours[(df_jours["_date"] >= premier) & (df_jours["_date"] <= dernier)]
-               if not df_jours.empty else df_jours)
-    nb_conflits = len(set(periode["ID"]) & conflits_globaux) if not periode.empty else 0
-
-    if nb_conflits:
-        st.markdown(
-            f"<div class='alerte-conflit'>⚠️ Attention : {nb_conflits} rdv se chevauchent "
-            f"sur cette période (encadrés en rouge).</div>",
-            unsafe_allow_html=True,
-        )
-
-    # ── Le calendrier ──────────────────────────────────────────────────
-    if vue == "mois":
-        st.markdown(vue_plusieurs_mois(periode, ref.year, ref.month, conflits_globaux),
-                    unsafe_allow_html=True)
-    else:
-        st.markdown(calendrier(periode, premier, 7 if vue == "semaine" else 1, conflits_globaux),
-                    unsafe_allow_html=True)
-
-    # ── Légende : les clients visibles + les catégories ───────────────
-    vus = {}
-    if not periode.empty:
-        for e in periode.drop_duplicates("ID").to_dict("records"):
-            if e["Catégorie"] == "Client":
-                nom = str(e.get("Client") or e["Titre"]).strip()
-                vus.setdefault(nom, couleur_rdv(e))
-    legende = "".join(
-        f"<span><i style='background:{coul}'></i>{escape(nom)}</span>" for nom, coul in sorted(vus.items())
-    )
-    legende += "".join(
-        f"<span><i style='background:{c['couleur']}'></i>{c['emoji']} {nom}</span>"
-        for nom, c in CATEGORIES.items() if nom != "Client"
-    )
-    legende += "<span><i style='background:#FFFFFF;box-shadow:inset 0 0 0 2px #C0392B'></i>⚠️ Chevauchement</span>"
-    st.markdown(f"<div class='cal-legende'>{legende}</div>", unsafe_allow_html=True)
-
-    if periode.empty:
-        st.caption("Rien de prévu sur cette période 🌿")
-    if vue == "semaine":
-        st.caption("📱 Sur téléphone, la vue « Mois » ou « Jour » est plus confortable.")
+def _vider_saisie():
+    for k in list(st.session_state.keys()):
+        if k.startswith("saisie_"):
+            del st.session_state[k]
 
 
-# =============================================================================
-# 13. ONGLET : NOUVEAU RDV
-# =============================================================================
-
-with tab_ajout:
+@st.dialog("➕ Nouveau rendez-vous", width="large")
+def fenetre_nouveau_rdv():
 
     categorie = st.radio(
         "🏷️ **Étape 1 — Quel type de rdv ?**",
@@ -1498,36 +1404,35 @@ with tab_ajout:
         "Notes": notes.strip(),
     }
 
-    @st.dialog("📅 Récapitulatif")
-    def confirmer(ligne, nb_conflits, fiche_a_creer=None):
-        cat = CATEGORIES[ligne["Catégorie"]]
-        st.markdown(f"### {cat['emoji']} {ligne['Titre']}")
-        d1 = datetime.strptime(ligne["Date"], "%d/%m/%Y").date()
-        if ligne["Date fin"]:
-            d2 = datetime.strptime(ligne["Date fin"], "%d/%m/%Y").date()
-            st.write(f"📅 Du {date_en_lettres(d1)} au {date_en_lettres(d2)}")
+    # ── Petit récapitulatif ────────────────────────────────────────────
+    if titre.strip():
+        if jour_fin != jour:
+            quand = f"du {date_en_lettres(jour)} au {date_en_lettres(jour_fin)}"
+        elif moment == "Heure précise":
+            quand = f"{date_en_lettres(jour)} · {debut_txt}–{fin_txt}"
         else:
-            st.write(f"📅 {date_en_lettres(d1)}")
-            if ligne["Moment"] == "Heure précise":
-                st.write(f"🕘 {ligne['Début']} – {ligne['Fin']}")
-            else:
-                st.write(f"{MOMENTS[ligne['Moment']]['emoji']} {ligne['Moment']}")
-        if ligne["Type prestation"]:
-            st.write(f"{EMOJIS_PRESTATION.get(ligne['Type prestation'], '')} {ligne['Type prestation']}")
-        if ligne["Lieu"]:
-            st.write(f"📍 {ligne['Lieu']}")
-        if ligne["Notes"]:
-            st.write(f"🗒️ {ligne['Notes']}")
+            quand = f"{date_en_lettres(jour)} · {MOMENTS[moment]['emoji']} {moment}"
+        fond = couleur_rdv(ligne)
+        st.markdown(
+            f"<div style='margin-top:14px;padding:10px 14px;border-radius:12px;"
+            f"background:{fond};color:{texte_lisible(fond)};font-weight:600;'>"
+            f"{CATEGORIES[categorie]['emoji']} {escape(titre.strip())}"
+            f"<div style='font-weight:400;font-size:.92rem;'>{quand}</div></div>",
+            unsafe_allow_html=True,
+        )
+    if fiche_a_creer:
+        st.info(f"🗂️ Une fiche client « {fiche_a_creer['Clé client']} » sera aussi créée.")
+    if not chevauchements.empty:
+        st.caption("Tu peux l'enregistrer quand même, le rdv sera encadré en rouge.")
 
-        if fiche_a_creer:
-            st.info(f"🗂️ Une fiche client « {fiche_a_creer['Clé client']} » sera aussi créée.")
-
-        if nb_conflits:
-            st.warning(f"⚠️ Ce rdv chevauche {nb_conflits} autre(s) rdv. Tu peux l'enregistrer quand même.")
-
-        st.divider()
-        col_ok, col_non = st.columns(2)
-        if col_ok.button("✅ Valider", type="primary", key="valider_dialog"):
+    # ── Boutons ────────────────────────────────────────────────────────
+    st.divider()
+    col_ok, col_non = st.columns(2)
+    if col_ok.button("💾 Enregistrer", type="primary", key="valider_dialog", use_container_width=True):
+        if not titre.strip():
+            st.error("Il manque juste le client 🙂" if categorie == "Client"
+                     else "Il manque juste le nom du rendez-vous 🙂")
+        else:
             with st.spinner("J'enregistre… ⏳"):
                 try:
                     message = "Rendez-vous ajouté au planning 🎉"
@@ -1537,36 +1442,145 @@ with tab_ajout:
                         else:
                             message += f" — la fiche « {fiche_a_creer['Clé client']} » existait déjà"
                     enregistrer(ligne)
-                    st.session_state["message_ok"] = message
-                    for k in list(st.session_state.keys()):
-                        if k.startswith("saisie_"):
-                            del st.session_state[k]
                 except Exception as e:
-                    st.session_state["message_erreur"] = str(e)
-            st.rerun()
-        if col_non.button("✏️ Modifier", key="annuler_dialog"):
-            st.rerun()
+                    st.error("Impossible d'écrire dans le Google Sheet. Vérifie qu'il est partagé en Éditeur.")
+                    st.caption(f"Détail technique : {e}")
+                    return
+            st.session_state["message_ok"] = message
+            _vider_saisie()
+            st.rerun()   # ferme la fenêtre et rafraîchit le calendrier
+    if col_non.button("Annuler", key="annuler_dialog", use_container_width=True):
+        _vider_saisie()
+        st.rerun()
 
-    if st.button("💾 Enregistrer", type="primary"):
-        if not titre.strip():
-            st.error("Il manque juste le client 🙂" if categorie == "Client"
-                     else "Il manque juste le nom du rendez-vous 🙂")
-        else:
-            confirmer(ligne, len(chevauchements), fiche_a_creer)
 
+tab_planning, tab_liste = st.tabs([
+    "📅 Calendrier",
+    "🔎 Tous les rdv",
+])
+
+
+# =============================================================================
+# 12. ONGLET : CALENDRIER
+# =============================================================================
+
+with tab_planning:
+
+    # ── Message après un enregistrement ───────────────────────────────
     if "message_ok" in st.session_state:
         st.balloons()
         st.success(st.session_state["message_ok"])
         del st.session_state["message_ok"]
 
-    if "message_erreur" in st.session_state:
-        st.error("Impossible d'écrire dans le Google Sheet. Vérifie qu'il est partagé en Éditeur.")
-        st.caption(f"Détail technique : {st.session_state['message_erreur']}")
-        del st.session_state["message_erreur"]
+    # ── Bouton qui ouvre la fenêtre « Nouveau rdv » ────────────────────
+    if st.button("➕ Nouveau rdv", type="primary", key="ouvrir_ajout", use_container_width=True):
+        fenetre_nouveau_rdv()
+
+    # ── Choix de l'affichage ───────────────────────────────────────────
+    # Le lien peut imposer l'affichage par défaut : ?vue=semaine ou ?vue=jour
+    VUES = {"mois": "🗓️ Mois", "semaine": "📅 Semaine", "jour": "📆 Jour"}
+
+    if "vue" not in st.session_state:
+        vue_lien = str(st.query_params.get("vue", "mois"))
+        st.session_state["vue"] = vue_lien if vue_lien in VUES else "mois"
+
+    vue = st.radio(
+        "Affichage",
+        list(VUES.keys()),
+        format_func=lambda v: VUES[v],
+        horizontal=True,
+        key="vue",
+        label_visibility="collapsed",
+    )
+
+    # Date de référence (mémorisée entre deux clics)
+    if "date_ref" not in st.session_state:
+        st.session_state["date_ref"] = date.today()
+
+    def decaler(sens):
+        """Avance (+1) ou recule (-1) d'un mois, d'une semaine ou d'un jour."""
+        ref = st.session_state["date_ref"]
+        if vue == "mois":
+            m = ref.month - 1 + sens
+            st.session_state["date_ref"] = date(ref.year + m // 12, m % 12 + 1, 1)
+        else:
+            st.session_state["date_ref"] = ref + timedelta(days=7 * sens if vue == "semaine" else sens)
+
+    c1, c2, c3 = st.columns(3)
+    if c1.button("◀ Précédent", key="nav_prec", use_container_width=True):
+        decaler(-1)
+        st.rerun()
+    if c2.button("Aujourd'hui", key="nav_auj", use_container_width=True):
+        st.session_state["date_ref"] = date.today()
+        st.rerun()
+    if c3.button("Suivant ▶", key="nav_suiv", use_container_width=True):
+        decaler(+1)
+        st.rerun()
+
+    ref = st.session_state["date_ref"]
+
+    # Période affichée
+    if vue == "mois":
+        premier = date(ref.year, ref.month, 1)
+        m = ref.month - 1 + 3   # 3 mois affichés sur ordinateur
+        dernier = date(ref.year + m // 12, m % 12 + 1, 1) - timedelta(days=1)
+        titre_periode = None   # chaque mois a son propre titre
+    elif vue == "semaine":
+        premier = ref - timedelta(days=ref.weekday())   # lundi
+        dernier = premier + timedelta(days=6)
+        titre_periode = (f"Semaine du {premier.day} {MOIS[premier.month - 1]} "
+                         f"au {dernier.day} {MOIS[dernier.month - 1]} {dernier.year}")
+    else:
+        premier = dernier = ref
+        titre_periode = date_en_lettres(ref).capitalize()
+
+    if titre_periode:
+        st.markdown(f"### {titre_periode}")
+
+    periode = (df_jours[(df_jours["_date"] >= premier) & (df_jours["_date"] <= dernier)]
+               if not df_jours.empty else df_jours)
+    nb_conflits = len(set(periode["ID"]) & conflits_globaux) if not periode.empty else 0
+
+    if nb_conflits:
+        st.markdown(
+            f"<div class='alerte-conflit'>⚠️ Attention : {nb_conflits} rdv se chevauchent "
+            f"sur cette période (encadrés en rouge).</div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Le calendrier ──────────────────────────────────────────────────
+    if vue == "mois":
+        st.markdown(vue_plusieurs_mois(periode, ref.year, ref.month, conflits_globaux),
+                    unsafe_allow_html=True)
+    else:
+        st.markdown(calendrier(periode, premier, 7 if vue == "semaine" else 1, conflits_globaux),
+                    unsafe_allow_html=True)
+
+    # ── Légende : les clients visibles + les catégories ───────────────
+    vus = {}
+    if not periode.empty:
+        for e in periode.drop_duplicates("ID").to_dict("records"):
+            if e["Catégorie"] == "Client":
+                nom = str(e.get("Client") or e["Titre"]).strip()
+                vus.setdefault(nom, couleur_rdv(e))
+    legende = "".join(
+        f"<span><i style='background:{coul}'></i>{escape(nom)}</span>" for nom, coul in sorted(vus.items())
+    )
+    legende += "".join(
+        f"<span><i style='background:{c['couleur']}'></i>{c['emoji']} {nom}</span>"
+        for nom, c in CATEGORIES.items() if nom != "Client"
+    )
+    legende += "<span><i style='background:#FFFFFF;box-shadow:inset 0 0 0 2px #C0392B'></i>⚠️ Chevauchement</span>"
+    st.markdown(f"<div class='cal-legende'>{legende}</div>", unsafe_allow_html=True)
+
+    if periode.empty:
+        st.caption("Rien de prévu sur cette période 🌿")
+    if vue == "semaine":
+        st.caption("📱 Sur téléphone, la vue « Mois » ou « Jour » est plus confortable.")
 
 
 # =============================================================================
-# 14. ONGLET : TOUS LES RDV
+# 13. ONGLET : TOUS LES RDV
 # =============================================================================
 
 with tab_liste:
